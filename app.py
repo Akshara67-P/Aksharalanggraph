@@ -1,13 +1,18 @@
 import os
-import uvicorn
-from typing import TypedDict, List, Optional
+import sys
+import subprocess
+import tempfile
+from typing import TypedDict, List, Optional, Literal
 
+import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
+
 from langserve import add_routes
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, BaseMessage
 from langchain_core.runnables import RunnableLambda
+
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from langgraph.graph import StateGraph, START, END
@@ -18,9 +23,10 @@ from langgraph.graph import StateGraph, START, END
 # ============================================================
 
 class CrewState(TypedDict):
-    messages: List
+    messages: List[BaseMessage]
     next_step: Optional[str]
     code: Optional[str]
+    execution_output: Optional[str]
     report: Optional[str]
     manager_choice: Optional[str]
 
@@ -39,7 +45,119 @@ llm = ChatGoogleGenerativeAI(
 
 
 # ============================================================
-# 3. TASK INPUT NODE
+# 3. CONVERT GEMINI RESPONSE TO NORMAL TEXT
+# ============================================================
+
+def response_to_text(response) -> str:
+
+    content = getattr(response, "content", response)
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+
+        parts = []
+
+        for item in content:
+
+            if isinstance(item, str):
+                parts.append(item)
+
+            elif isinstance(item, dict):
+
+                if "text" in item:
+                    parts.append(str(item["text"]))
+
+        return "\n".join(parts)
+
+    return str(content)
+
+
+# ============================================================
+# 4. CLEAN PYTHON CODE
+# ============================================================
+
+def clean_code(code: str) -> str:
+
+    code = code.strip()
+
+    if code.startswith("```python"):
+        code = code[len("```python"):].strip()
+
+    elif code.startswith("```"):
+        code = code[3:].strip()
+
+    if code.endswith("```"):
+        code = code[:-3].strip()
+
+    return code
+
+
+# ============================================================
+# 5. EXECUTE GENERATED PYTHON CODE
+# ============================================================
+
+def run_python_code(code: str) -> str:
+
+    code = clean_code(code)
+
+    file_path = None
+
+    try:
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".py",
+            delete=False,
+            encoding="utf-8"
+        ) as file:
+
+            file.write(code)
+            file_path = file.name
+
+        result = subprocess.run(
+            [sys.executable, file_path],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        output = result.stdout.strip()
+        error = result.stderr.strip()
+
+        if result.returncode == 0:
+
+            if output:
+                return output
+
+            return "Program executed successfully with no output."
+
+        return "PROGRAM ERROR:\n" + error
+
+    except subprocess.TimeoutExpired:
+
+        return (
+            "PROGRAM ERROR:\n"
+            "Program exceeded the 10-second execution limit."
+        )
+
+    except Exception as e:
+
+        return "PROGRAM ERROR:\n" + str(e)
+
+    finally:
+
+        if file_path:
+
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+
+
+# ============================================================
+# 6. TASK INPUT NODE
 # ============================================================
 
 def task_input_node(state: CrewState):
@@ -50,7 +168,7 @@ def task_input_node(state: CrewState):
 
 
 # ============================================================
-# 4. REAL-TIME DEVELOPER NODE
+# 7. DEVELOPER NODE
 # ============================================================
 
 def developer_node(state: CrewState):
@@ -60,25 +178,30 @@ def developer_node(state: CrewState):
     if messages:
         task = messages[-1].content
     else:
-        task = "No task provided."
+        task = "Create a simple Python program."
 
     prompt = f"""
 You are a real-time Python developer.
 
-Write a correct Python program for the following task:
+Programming task:
 
 {task}
 
-Requirements:
-- Write simple and correct Python code.
-- Return only the Python code.
-- Do not include explanations.
-- Do not use Markdown code fences.
+Write a complete and executable Python program.
+
+Rules:
+1. Return ONLY Python code.
+2. Do not use Markdown.
+3. Do not use ``` symbols.
+4. Make the program directly executable.
+5. Include a sample value when the task needs an input.
 """
 
     response = llm.invoke(prompt)
 
-    generated_code = response.content
+    generated_code = clean_code(
+        response_to_text(response)
+    )
 
     return {
         "code": generated_code,
@@ -87,42 +210,60 @@ Requirements:
 
 
 # ============================================================
-# 5. REAL-TIME TESTER NODE
+# 8. TESTER NODE
 # ============================================================
 
 def tester_node(state: CrewState):
 
     code = state.get("code", "")
 
+    # Actually execute generated code
+    execution_output = run_python_code(code)
+
     prompt = f"""
 You are a Senior QA Engineer.
 
-Analyze and test the following Python program:
+Generated Python code:
+
+---------------- CODE ----------------
 
 {code}
 
-Create a simple testing report containing:
+-------------- END CODE --------------
+
+Actual execution result:
+
+------------- RESULT -----------------
+
+{execution_output}
+
+----------- END RESULT ---------------
+
+Prepare a testing report containing:
 
 1. Test scenarios
 2. Expected results
-3. Possible issues
-4. Overall testing status
+3. Actual execution result
+4. Possible issues
+5. Overall testing status
 
-Keep the report clear and simple.
+Use the actual execution result above.
+Do not invent results.
 """
 
     response = llm.invoke(prompt)
 
-    report = response.content
+    report = response_to_text(response)
 
     return {
+        "execution_output": execution_output,
         "report": report,
         "next_step": "manager_decision"
     }
 
 
 # ============================================================
-# 6. MANAGER DECISION NODE
+# 9. MANAGER DECISION NODE
 # ============================================================
 
 def manager_decision_node(state: CrewState):
@@ -138,15 +279,13 @@ def manager_decision_node(state: CrewState):
             "next_step": "archiver"
         }
 
-    else:
-
-        return {
-            "next_step": "task_input"
-        }
+    return {
+        "next_step": "task_input"
+    }
 
 
 # ============================================================
-# 7. ARCHIVER NODE
+# 10. ARCHIVER NODE
 # ============================================================
 
 def archiver_node(state: CrewState):
@@ -157,7 +296,7 @@ def archiver_node(state: CrewState):
 
 
 # ============================================================
-# 8. ROUTING FUNCTIONS
+# 11. ROUTING
 # ============================================================
 
 def route_from_input(state: CrewState):
@@ -165,21 +304,19 @@ def route_from_input(state: CrewState):
     return "developer"
 
 
-def route_from_decision(state: CrewState):
+def route_from_manager(state: CrewState):
 
     if state.get("next_step") == "archiver":
-
         return "archiver"
 
     return "task_input"
 
 
 # ============================================================
-# 9. CREATE LANGGRAPH WORKFLOW
+# 12. BUILD LANGGRAPH
 # ============================================================
 
 workflow = StateGraph(CrewState)
-
 
 workflow.add_node(
     "task_input",
@@ -207,10 +344,6 @@ workflow.add_node(
 )
 
 
-# ============================================================
-# 10. WORKFLOW EDGES
-# ============================================================
-
 workflow.add_edge(
     START,
     "task_input"
@@ -233,7 +366,7 @@ workflow.add_edge(
 
 workflow.add_conditional_edges(
     "manager_decision",
-    route_from_decision
+    route_from_manager
 )
 
 workflow.add_edge(
@@ -242,23 +375,46 @@ workflow.add_edge(
 )
 
 
-# Compile LangGraph
 graph = workflow.compile()
 
 
 # ============================================================
-# 11. PLAYGROUND INPUT SCHEMA
+# 13. PLAYGROUND INPUT
 # ============================================================
 
 class AgentInput(BaseModel):
 
     input: str
 
-    manager_choice: str = "store"
+    manager_choice: Literal[
+        "store",
+        "another"
+    ] = "store"
 
 
 # ============================================================
-# 12. RUN AGENT
+# 14. PLAYGROUND OUTPUT
+# ============================================================
+
+class AgentOutput(BaseModel):
+
+    status: str
+
+    generated_code: Optional[str] = None
+
+    execution_output: Optional[str] = None
+
+    testing_report: Optional[str] = None
+
+    next_step: Optional[str] = None
+
+    manager_choice: Optional[str] = None
+
+    error: Optional[str] = None
+
+
+# ============================================================
+# 15. RUN AGENT
 # ============================================================
 
 def run_agent(data):
@@ -267,7 +423,7 @@ def run_agent(data):
 
         user_input = data.get(
             "input",
-            "Create a Python program."
+            ""
         )
 
         manager_choice = data.get(
@@ -275,7 +431,14 @@ def run_agent(data):
             "store"
         )
 
-        initial_state = {
+        if not user_input.strip():
+
+            return {
+                "status": "error",
+                "error": "Please enter a programming task."
+            }
+
+        initial_state: CrewState = {
 
             "messages": [
                 HumanMessage(
@@ -287,11 +450,12 @@ def run_agent(data):
 
             "code": None,
 
+            "execution_output": None,
+
             "report": None,
 
             "manager_choice": manager_choice
         }
-
 
         result = graph.invoke(
             initial_state,
@@ -300,28 +464,35 @@ def run_agent(data):
             }
         )
 
-
         return {
 
             "status": "success",
 
             "generated_code": result.get(
-                "code"
+                "code",
+                ""
+            ),
+
+            "execution_output": result.get(
+                "execution_output",
+                ""
             ),
 
             "testing_report": result.get(
-                "report"
+                "report",
+                ""
             ),
 
             "next_step": result.get(
-                "next_step"
+                "next_step",
+                ""
             ),
 
             "manager_choice": result.get(
-                "manager_choice"
+                "manager_choice",
+                manager_choice
             )
         }
-
 
     except Exception as e:
 
@@ -334,18 +505,19 @@ def run_agent(data):
 
 
 # ============================================================
-# 13. LANGSERVE CHAIN
+# 16. LANGSERVE
 # ============================================================
 
 agent_chain = RunnableLambda(
     run_agent
 ).with_types(
-    input_type=AgentInput
+    input_type=AgentInput,
+    output_type=AgentOutput
 )
 
 
 # ============================================================
-# 14. FASTAPI APPLICATION
+# 17. FASTAPI
 # ============================================================
 
 app = FastAPI(
@@ -355,7 +527,7 @@ app = FastAPI(
 
 
 # ============================================================
-# 15. LANGSERVE /agent ROUTE
+# 18. /agent ROUTE
 # ============================================================
 
 add_routes(
@@ -366,7 +538,7 @@ add_routes(
 
 
 # ============================================================
-# 16. START SERVER
+# 19. START SERVER
 # ============================================================
 
 if __name__ == "__main__":
@@ -374,7 +546,7 @@ if __name__ == "__main__":
     port = int(
         os.environ.get(
             "PORT",
-            8000
+            "8000"
         )
     )
 
