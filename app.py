@@ -14,7 +14,7 @@ from langgraph.graph import StateGraph, START, END
 
 
 # =========================
-# 1. STATE
+# STATE
 # =========================
 
 class CrewState(TypedDict):
@@ -26,12 +26,12 @@ class CrewState(TypedDict):
 
 
 # =========================
-# 2. GEMINI MODEL
+# GEMINI
 # =========================
 
 GOOGLE_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-llm_flash = ChatGoogleGenerativeAI(
+llm = ChatGoogleGenerativeAI(
     model="gemma-4-31b-it",
     google_api_key=GOOGLE_API_KEY,
     temperature=0
@@ -39,92 +39,78 @@ llm_flash = ChatGoogleGenerativeAI(
 
 
 # =========================
-# 3. TASK INPUT NODE
+# TASK INPUT
 # =========================
 
-def task_input_node(state: CrewState):
+def task_input_node(state):
     return {
         "next_step": "developer"
     }
 
 
 # =========================
-# 4. DEVELOPER NODE
+# DEVELOPER
 # =========================
 
-def real_time_developer(state: CrewState):
+def developer_node(state):
 
-    messages = state.get("messages", [])
-
-    if messages:
-        task = messages[-1].content
-    else:
-        task = "No task provided."
+    task = state["messages"][-1].content
 
     prompt = f"""
-You are a real-time developer.
+You are a Python developer.
 
-Write a Python program for the following coding task:
-
+Task:
 {task}
+
+Write a correct Python program.
 
 Return only the Python code.
 """
 
-    response = llm_flash.invoke(prompt)
-
-    if hasattr(response, "content"):
-        generated_code = response.content
-    else:
-        generated_code = str(response)
+    response = llm.invoke(prompt)
 
     return {
-        "code": generated_code,
+        "code": response.content,
         "next_step": "tester"
     }
 
 
 # =========================
-# 5. TESTER NODE
+# TESTER
 # =========================
 
-def real_time_tester(state: CrewState):
+def tester_node(state):
 
     code = state.get("code", "")
 
     prompt = f"""
-You are a Senior QA Engineer.
+You are a software tester.
 
-Analyze the following Python code:
+Test/analyze this Python code:
 
 {code}
 
-Generate a simple testing report containing:
+Give a simple testing report with:
 
 1. Test scenarios
-2. Expected result
+2. Expected results
 3. Possible issues
-4. Overall testing status
+4. Overall status
 """
 
-    response = llm_flash.invoke(prompt)
-
-    if hasattr(response, "content"):
-        report = response.content
-    else:
-        report = str(response)
+    response = llm.invoke(prompt)
 
     return {
-        "report": report,
+        "report": response.content,
         "next_step": "manager_decision"
     }
 
 
 # =========================
-# 6. MANAGER DECISION
+# MANAGER
 # =========================
 
-def manager_decision_node(state: CrewState):
+def manager_node(state):
 
     choice = state.get("manager_choice", "store")
 
@@ -139,10 +125,10 @@ def manager_decision_node(state: CrewState):
 
 
 # =========================
-# 7. ARCHIVER
+# ARCHIVER
 # =========================
 
-def archiver_node(state: CrewState):
+def archiver_node(state):
 
     return {
         "next_step": "exit"
@@ -150,18 +136,15 @@ def archiver_node(state: CrewState):
 
 
 # =========================
-# 8. ROUTING
+# ROUTING
 # =========================
 
-def route_from_input(state: CrewState):
-
-    if state.get("next_step") == "exit":
-        return END
+def route_input(state):
 
     return "developer"
 
 
-def route_from_decision(state: CrewState):
+def route_manager(state):
 
     if state.get("next_step") == "archiver":
         return "archiver"
@@ -170,71 +153,49 @@ def route_from_decision(state: CrewState):
 
 
 # =========================
-# 9. LANGGRAPH WORKFLOW
+# LANGGRAPH
 # =========================
 
-rt_workflow = StateGraph(CrewState)
+workflow = StateGraph(CrewState)
 
-rt_workflow.add_node(
+workflow.add_node("task_input", task_input_node)
+workflow.add_node("developer", developer_node)
+workflow.add_node("tester", tester_node)
+workflow.add_node("manager_decision", manager_node)
+workflow.add_node("archiver", archiver_node)
+
+workflow.add_edge(START, "task_input")
+
+workflow.add_conditional_edges(
     "task_input",
-    task_input_node
+    route_input
 )
 
-rt_workflow.add_node(
-    "developer",
-    real_time_developer
-)
-
-rt_workflow.add_node(
-    "tester",
-    real_time_tester
-)
-
-rt_workflow.add_node(
-    "manager_decision",
-    manager_decision_node
-)
-
-rt_workflow.add_node(
-    "archiver",
-    archiver_node
-)
-
-rt_workflow.add_edge(
-    START,
-    "task_input"
-)
-
-rt_workflow.add_conditional_edges(
-    "task_input",
-    route_from_input
-)
-
-rt_workflow.add_edge(
+workflow.add_edge(
     "developer",
     "tester"
 )
 
-rt_workflow.add_edge(
+workflow.add_edge(
     "tester",
     "manager_decision"
 )
 
-rt_workflow.add_conditional_edges(
+workflow.add_conditional_edges(
     "manager_decision",
-    route_from_decision
+    route_manager
 )
 
-rt_workflow.add_edge(
+workflow.add_edge(
     "archiver",
     END
 )
 
-rt_app = rt_workflow.compile()
+graph = workflow.compile()
 
 
 # =========================
-# 10. PLAYGROUND INPUT
+# PLAYGROUND INPUT
 # =========================
 
 class AgentInput(BaseModel):
@@ -243,43 +204,54 @@ class AgentInput(BaseModel):
 
 
 # =========================
-# 11. RUN AGENT
+# RUN AGENT
 # =========================
 
 def run_agent(data):
 
-    user_input = data.get(
-        "input",
-        "Create a Python program."
-    )
+    try:
 
-    manager_choice = data.get(
-        "manager_choice",
-        "store"
-    )
+        user_input = data["input"]
 
-    initial_state = {
-        "messages": [
-            HumanMessage(content=user_input)
-        ],
-        "next_step": None,
-        "code": None,
-        "report": None,
-        "manager_choice": manager_choice
-    }
+        manager_choice = data.get(
+            "manager_choice",
+            "store"
+        )
 
-    result = rt_app.invoke(initial_state)
+        state = {
+            "messages": [
+                HumanMessage(content=user_input)
+            ],
+            "next_step": None,
+            "code": None,
+            "report": None,
+            "manager_choice": manager_choice
+        }
 
-    return {
-        "code": result.get("code"),
-        "report": result.get("report"),
-        "next_step": result.get("next_step"),
-        "manager_choice": result.get("manager_choice")
-    }
+        result = graph.invoke(
+            state,
+            config={
+                "recursion_limit": 20
+            }
+        )
+
+        return {
+            "status": "success",
+            "generated_code": result.get("code"),
+            "testing_report": result.get("report"),
+            "next_step": result.get("next_step")
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "error": str(e)
+        }
 
 
 # =========================
-# 12. LANGSERVE CHAIN
+# LANGSERVE
 # =========================
 
 agent_chain = RunnableLambda(
@@ -290,18 +262,14 @@ agent_chain = RunnableLambda(
 
 
 # =========================
-# 13. FASTAPI
+# FASTAPI
 # =========================
 
 app = FastAPI(
-    title="LangGraph Verilog Workflow",
+    title="LangGraph Real-Time Developer Workflow",
     version="1.0"
 )
 
-
-# =========================
-# 14. /agent ROUTE
-# =========================
 
 add_routes(
     app,
@@ -311,7 +279,7 @@ add_routes(
 
 
 # =========================
-# 15. START SERVER
+# SERVER
 # =========================
 
 if __name__ == "__main__":
