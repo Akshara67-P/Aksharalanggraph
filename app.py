@@ -13,9 +13,9 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START, END
 
 
-# =========================
-# STATE
-# =========================
+# ============================================================
+# 1. WORKFLOW STATE
+# ============================================================
 
 class CrewState(TypedDict):
     messages: List
@@ -25,150 +25,200 @@ class CrewState(TypedDict):
     manager_choice: Optional[str]
 
 
-# =========================
-# GEMINI
-# =========================
+# ============================================================
+# 2. GEMINI MODEL
+# ============================================================
 
 GOOGLE_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 llm = ChatGoogleGenerativeAI(
-    model="gemma-4-31b-it",
+    model="gemini-3.1-flash-lite",
     google_api_key=GOOGLE_API_KEY,
     temperature=0
 )
 
 
-# =========================
-# TASK INPUT
-# =========================
+# ============================================================
+# 3. TASK INPUT NODE
+# ============================================================
 
-def task_input_node(state):
+def task_input_node(state: CrewState):
+
     return {
         "next_step": "developer"
     }
 
 
-# =========================
-# DEVELOPER
-# =========================
+# ============================================================
+# 4. REAL-TIME DEVELOPER NODE
+# ============================================================
 
-def developer_node(state):
+def developer_node(state: CrewState):
 
-    task = state["messages"][-1].content
+    messages = state.get("messages", [])
+
+    if messages:
+        task = messages[-1].content
+    else:
+        task = "No task provided."
 
     prompt = f"""
-You are a Python developer.
+You are a real-time Python developer.
 
-Task:
+Write a correct Python program for the following task:
+
 {task}
 
-Write a correct Python program.
-
-Return only the Python code.
+Requirements:
+- Write simple and correct Python code.
+- Return only the Python code.
+- Do not include explanations.
+- Do not use Markdown code fences.
 """
 
     response = llm.invoke(prompt)
 
+    generated_code = response.content
+
     return {
-        "code": response.content,
+        "code": generated_code,
         "next_step": "tester"
     }
 
 
-# =========================
-# TESTER
-# =========================
+# ============================================================
+# 5. REAL-TIME TESTER NODE
+# ============================================================
 
-def tester_node(state):
+def tester_node(state: CrewState):
 
     code = state.get("code", "")
 
     prompt = f"""
-You are a software tester.
+You are a Senior QA Engineer.
 
-Test/analyze this Python code:
+Analyze and test the following Python program:
 
 {code}
 
-Give a simple testing report with:
+Create a simple testing report containing:
 
 1. Test scenarios
 2. Expected results
 3. Possible issues
-4. Overall status
+4. Overall testing status
+
+Keep the report clear and simple.
 """
 
     response = llm.invoke(prompt)
 
+    report = response.content
+
     return {
-        "report": response.content,
+        "report": report,
         "next_step": "manager_decision"
     }
 
 
-# =========================
-# MANAGER
-# =========================
+# ============================================================
+# 6. MANAGER DECISION NODE
+# ============================================================
 
-def manager_node(state):
+def manager_decision_node(state: CrewState):
 
-    choice = state.get("manager_choice", "store")
+    choice = state.get(
+        "manager_choice",
+        "store"
+    )
 
     if choice.lower() == "store":
+
         return {
             "next_step": "archiver"
         }
 
-    return {
-        "next_step": "task_input"
-    }
+    else:
+
+        return {
+            "next_step": "task_input"
+        }
 
 
-# =========================
-# ARCHIVER
-# =========================
+# ============================================================
+# 7. ARCHIVER NODE
+# ============================================================
 
-def archiver_node(state):
+def archiver_node(state: CrewState):
 
     return {
         "next_step": "exit"
     }
 
 
-# =========================
-# ROUTING
-# =========================
+# ============================================================
+# 8. ROUTING FUNCTIONS
+# ============================================================
 
-def route_input(state):
+def route_from_input(state: CrewState):
 
     return "developer"
 
 
-def route_manager(state):
+def route_from_decision(state: CrewState):
 
     if state.get("next_step") == "archiver":
+
         return "archiver"
 
     return "task_input"
 
 
-# =========================
-# LANGGRAPH
-# =========================
+# ============================================================
+# 9. CREATE LANGGRAPH WORKFLOW
+# ============================================================
 
 workflow = StateGraph(CrewState)
 
-workflow.add_node("task_input", task_input_node)
-workflow.add_node("developer", developer_node)
-workflow.add_node("tester", tester_node)
-workflow.add_node("manager_decision", manager_node)
-workflow.add_node("archiver", archiver_node)
 
-workflow.add_edge(START, "task_input")
+workflow.add_node(
+    "task_input",
+    task_input_node
+)
+
+workflow.add_node(
+    "developer",
+    developer_node
+)
+
+workflow.add_node(
+    "tester",
+    tester_node
+)
+
+workflow.add_node(
+    "manager_decision",
+    manager_decision_node
+)
+
+workflow.add_node(
+    "archiver",
+    archiver_node
+)
+
+
+# ============================================================
+# 10. WORKFLOW EDGES
+# ============================================================
+
+workflow.add_edge(
+    START,
+    "task_input"
+)
 
 workflow.add_conditional_edges(
     "task_input",
-    route_input
+    route_from_input
 )
 
 workflow.add_edge(
@@ -183,7 +233,7 @@ workflow.add_edge(
 
 workflow.add_conditional_edges(
     "manager_decision",
-    route_manager
+    route_from_decision
 )
 
 workflow.add_edge(
@@ -191,68 +241,101 @@ workflow.add_edge(
     END
 )
 
+
+# Compile LangGraph
 graph = workflow.compile()
 
 
-# =========================
-# PLAYGROUND INPUT
-# =========================
+# ============================================================
+# 11. PLAYGROUND INPUT SCHEMA
+# ============================================================
 
 class AgentInput(BaseModel):
+
     input: str
+
     manager_choice: str = "store"
 
 
-# =========================
-# RUN AGENT
-# =========================
+# ============================================================
+# 12. RUN AGENT
+# ============================================================
 
 def run_agent(data):
 
     try:
 
-        user_input = data["input"]
+        user_input = data.get(
+            "input",
+            "Create a Python program."
+        )
 
         manager_choice = data.get(
             "manager_choice",
             "store"
         )
 
-        state = {
+        initial_state = {
+
             "messages": [
-                HumanMessage(content=user_input)
+                HumanMessage(
+                    content=user_input
+                )
             ],
+
             "next_step": None,
+
             "code": None,
+
             "report": None,
+
             "manager_choice": manager_choice
         }
 
+
         result = graph.invoke(
-            state,
+            initial_state,
             config={
                 "recursion_limit": 20
             }
         )
 
+
         return {
+
             "status": "success",
-            "generated_code": result.get("code"),
-            "testing_report": result.get("report"),
-            "next_step": result.get("next_step")
+
+            "generated_code": result.get(
+                "code"
+            ),
+
+            "testing_report": result.get(
+                "report"
+            ),
+
+            "next_step": result.get(
+                "next_step"
+            ),
+
+            "manager_choice": result.get(
+                "manager_choice"
+            )
         }
+
 
     except Exception as e:
 
         return {
+
             "status": "error",
+
             "error": str(e)
         }
 
 
-# =========================
-# LANGSERVE
-# =========================
+# ============================================================
+# 13. LANGSERVE CHAIN
+# ============================================================
 
 agent_chain = RunnableLambda(
     run_agent
@@ -261,15 +344,19 @@ agent_chain = RunnableLambda(
 )
 
 
-# =========================
-# FASTAPI
-# =========================
+# ============================================================
+# 14. FASTAPI APPLICATION
+# ============================================================
 
 app = FastAPI(
     title="LangGraph Real-Time Developer Workflow",
     version="1.0"
 )
 
+
+# ============================================================
+# 15. LANGSERVE /agent ROUTE
+# ============================================================
 
 add_routes(
     app,
@@ -278,9 +365,9 @@ add_routes(
 )
 
 
-# =========================
-# SERVER
-# =========================
+# ============================================================
+# 16. START SERVER
+# ============================================================
 
 if __name__ == "__main__":
 
